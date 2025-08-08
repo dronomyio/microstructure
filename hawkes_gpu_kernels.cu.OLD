@@ -1,0 +1,463 @@
+#include "hawkes_gpu_kernels.h"
+#include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <math.h>
+#include <float.h>
+
+// CUDA kernel constants
+#define BLOCK_SIZE 256
+#define MAX_EVENTS_PER_BLOCK 1024
+#define WARP_SIZE 32
+
+// Shared memory for efficient computation
+__shared__ float shared_intensities[BLOCK_SIZE];
+__shared__ float shared_times[BLOCK_SIZE];
+__shared__ float shared_marks[BLOCK_SIZE];
+
+/**
+ * GPU Kernel: Calculate exponential decay for Hawkes intensity
+ * Computes exp(-beta * (t - t_i)) for all event pairs
+ */
+__global__ void calculate_exponential_decay_kernel(
+    const HawkesEvent* events,
+    float* decay_matrix,
+    int n_events,
+    float beta
+) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (i < n_events && j < n_events) {
+        if (i > j) {  // Only compute for t_i > t_j (causal)
+            float time_diff = events[i].timestamp_ns - events[j].timestamp_ns;
+            float time_diff_seconds = time_diff * 1e-9f;  // Convert nanoseconds to seconds
+            decay_matrix[i * n_events + j] = expf(-beta * time_diff_seconds);
+        } else {
+            decay_matrix[i * n_events + j] = 0.0f;  // No influence from future events
+        }
+    }
+}
+
+/**
+ * GPU Kernel: Calculate Hawkes intensity at each event time
+ * λ(t) = μ + Σ α * exp(-β * (t - t_i)) for all t_i < t
+ */
+__global__ void calculate_hawkes_intensity_kernel(
+    const HawkesEvent* events,
+    const float* decay_matrix,
+    float* intensities,
+    int n_events,
+    float mu,
+    float alpha,
+    int mark_type
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (tid < n_events) {
+        float intensity = mu;  // Base intensity
+        
+        // Sum contributions from all previous events of the same mark type
+        for (int j = 0; j < tid; j++) {
+            if (events[j].mark == mark_type || mark_type == -1) {  // -1 means all marks
+                intensity += alpha * decay_matrix[tid * n_events + j];
+            }
+        }
+        
+        intensities[tid] = intensity;
+    }
+}
+
+/**
+ * GPU Kernel: Calculate log-likelihood for Hawkes process
+ * LL = Σ log(λ(t_i)) - ∫ λ(t) dt
+ */
+__global__ void calculate_log_likelihood_kernel(
+    const HawkesEvent* events,
+    const float* intensities,
+    float* log_likelihood_terms,
+    int n_events,
+    float mu,
+    float alpha,
+    float beta,
+    float T_end
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (tid < n_events) {
+        // Log intensity term
+        float log_intensity = logf(fmaxf(intensities[tid], 1e-10f));  // Avoid log(0)
+        
+        // Integral term approximation (compensator)
+        float integral_term = 0.0f;
+        if (tid == 0) {
+            // Calculate integral for the entire process
+            float T_seconds = T_end * 1e-9f;
+            integral_term = mu * T_seconds;
+            
+            // Add integral of jump terms
+            for (int i = 0; i < n_events; i++) {
+                float t_i = events[i].timestamp_ns * 1e-9f;
+                integral_term += (alpha / beta) * (1.0f - expf(-beta * (T_seconds - t_i)));
+            }
+        }
+        
+        log_likelihood_terms[tid] = log_intensity - (tid == 0 ? integral_term : 0.0f);
+    }
+}
+
+/**
+ * GPU Kernel: Calculate branching ratio and criticality
+ * Branching ratio = α/β, criticality indicates if process is subcritical
+ */
+__global__ void calculate_branching_ratio_kernel(
+    float* branching_ratios,
+    float* criticality_indicators,
+    const float* alphas,
+    const float* betas,
+    int n_processes
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (tid < n_processes) {
+        float alpha = alphas[tid];
+        float beta = betas[tid];
+        
+        branching_ratios[tid] = alpha / fmaxf(beta, 1e-10f);
+        criticality_indicators[tid] = (branching_ratios[tid] < 1.0f) ? 1.0f : 0.0f;  // 1 = subcritical
+    }
+}
+
+/**
+ * GPU Kernel: Estimate Hawkes parameters using Maximum Likelihood
+ * Uses gradient descent optimization on GPU
+ */
+__global__ void estimate_hawkes_parameters_kernel(
+    const HawkesEvent* events,
+    float* mu,
+    float* alpha,
+    float* beta,
+    float* gradients,
+    int n_events,
+    float learning_rate,
+    int iteration
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (tid == 0) {  // Single thread for parameter update
+        float current_mu = *mu;
+        float current_alpha = *alpha;
+        float current_beta = *beta;
+        
+        // Calculate gradients (simplified version)
+        float grad_mu = 0.0f;
+        float grad_alpha = 0.0f;
+        float grad_beta = 0.0f;
+        
+        // Compute gradients based on log-likelihood
+        for (int i = 0; i < n_events; i++) {
+            float intensity = current_mu;
+            float sum_decay = 0.0f;
+            float sum_weighted_decay = 0.0f;
+            
+            for (int j = 0; j < i; j++) {
+                float time_diff = (events[i].timestamp_ns - events[j].timestamp_ns) * 1e-9f;
+                float decay = expf(-current_beta * time_diff);
+                sum_decay += decay;
+                sum_weighted_decay += time_diff * decay;
+            }
+            
+            intensity += current_alpha * sum_decay;
+            
+            // Gradient contributions
+            grad_mu += 1.0f / fmaxf(intensity, 1e-10f);
+            grad_alpha += sum_decay / fmaxf(intensity, 1e-10f);
+            grad_beta += current_alpha * sum_weighted_decay / fmaxf(intensity, 1e-10f);
+        }
+        
+        // Subtract integral terms (simplified)
+        float T_total = (events[n_events-1].timestamp_ns - events[0].timestamp_ns) * 1e-9f;
+        grad_mu -= T_total;
+        grad_alpha -= n_events / fmaxf(current_beta, 1e-10f);
+        
+        // Update parameters with learning rate decay
+        float lr = learning_rate / (1.0f + 0.01f * iteration);
+        *mu = fmaxf(current_mu + lr * grad_mu, 1e-6f);
+        *alpha = fmaxf(current_alpha + lr * grad_alpha, 1e-6f);
+        *beta = fmaxf(current_beta + lr * grad_beta, 1e-6f);
+        
+        // Store gradients for monitoring
+        gradients[0] = grad_mu;
+        gradients[1] = grad_alpha;
+        gradients[2] = grad_beta;
+    }
+}
+
+/**
+ * GPU Kernel: Calculate event clustering coefficient
+ * Measures how clustered events are in time
+ */
+__global__ void calculate_clustering_coefficient_kernel(
+    const HawkesEvent* events,
+    float* clustering_coefficients,
+    int n_events,
+    float time_window_ns
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (tid < n_events) {
+        int neighbors = 0;
+        int connections = 0;
+        
+        // Find neighbors within time window
+        for (int i = 0; i < n_events; i++) {
+            if (i != tid) {
+                float time_diff = fabsf(events[tid].timestamp_ns - events[i].timestamp_ns);
+                if (time_diff <= time_window_ns) {
+                    neighbors++;
+                }
+            }
+        }
+        
+        // Calculate clustering (simplified version)
+        if (neighbors > 1) {
+            for (int i = 0; i < n_events; i++) {
+                for (int j = i + 1; j < n_events; j++) {
+                    if (i != tid && j != tid) {
+                        float diff_i = fabsf(events[tid].timestamp_ns - events[i].timestamp_ns);
+                        float diff_j = fabsf(events[tid].timestamp_ns - events[j].timestamp_ns);
+                        float diff_ij = fabsf(events[i].timestamp_ns - events[j].timestamp_ns);
+                        
+                        if (diff_i <= time_window_ns && diff_j <= time_window_ns && 
+                            diff_ij <= time_window_ns) {
+                            connections++;
+                        }
+                    }
+                }
+            }
+            
+            float max_connections = neighbors * (neighbors - 1) / 2.0f;
+            clustering_coefficients[tid] = connections / fmaxf(max_connections, 1.0f);
+        } else {
+            clustering_coefficients[tid] = 0.0f;
+        }
+    }
+}
+
+/**
+ * GPU Kernel: Simulate Hawkes process (Ogata's thinning algorithm)
+ * Generates synthetic events based on estimated parameters
+ */
+__global__ void simulate_hawkes_process_kernel(
+    HawkesEvent* simulated_events,
+    int* n_simulated,
+    float mu,
+    float alpha,
+    float beta,
+    uint64_t start_time_ns,
+    uint64_t end_time_ns,
+    unsigned int* random_states,
+    int max_events
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (tid == 0) {  // Single thread simulation
+        int event_count = 0;
+        uint64_t current_time = start_time_ns;
+        float current_intensity = mu;
+        
+        // Initialize random state
+        unsigned int rand_state = random_states[0];
+        
+        while (current_time < end_time_ns && event_count < max_events) {
+            // Generate inter-arrival time using thinning
+            float lambda_max = current_intensity + alpha;  // Upper bound
+            
+            // Generate candidate time
+            rand_state = rand_state * 1103515245 + 12345;  // Simple LCG
+            float u1 = (rand_state & 0x7FFFFFFF) / (float)0x7FFFFFFF;
+            float inter_arrival = -logf(u1) / lambda_max;
+            
+            uint64_t candidate_time = current_time + (uint64_t)(inter_arrival * 1e9f);
+            
+            if (candidate_time >= end_time_ns) break;
+            
+            // Calculate actual intensity at candidate time
+            float actual_intensity = mu;
+            for (int i = 0; i < event_count; i++) {
+                float time_diff = (candidate_time - simulated_events[i].timestamp_ns) * 1e-9f;
+                actual_intensity += alpha * expf(-beta * time_diff);
+            }
+            
+            // Accept/reject
+            rand_state = rand_state * 1103515245 + 12345;
+            float u2 = (rand_state & 0x7FFFFFFF) / (float)0x7FFFFFFF;
+            
+            if (u2 * lambda_max <= actual_intensity) {
+                // Accept event
+                simulated_events[event_count].timestamp_ns = candidate_time;
+                simulated_events[event_count].mark = 0;  // Default mark
+                simulated_events[event_count].intensity = actual_intensity;
+                event_count++;
+                current_intensity = actual_intensity;
+            }
+            
+            current_time = candidate_time;
+        }
+        
+        *n_simulated = event_count;
+        random_states[0] = rand_state;  // Update random state
+    }
+}
+
+/**
+ * GPU Kernel: Calculate Hawkes process residuals
+ * Computes transformed times for goodness-of-fit testing
+ */
+__global__ void calculate_hawkes_residuals_kernel(
+    const HawkesEvent* events,
+    const float* intensities,
+    float* residuals,
+    int n_events,
+    float mu,
+    float alpha,
+    float beta
+) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (tid < n_events) {
+        // Calculate compensator (integrated intensity) up to time t_i
+        float compensator = 0.0f;
+        float t_i = events[tid].timestamp_ns * 1e-9f;
+        
+        if (tid == 0) {
+            compensator = mu * t_i;
+        } else {
+            float t_prev = events[tid-1].timestamp_ns * 1e-9f;
+            compensator = mu * t_i;
+            
+            // Add jump contributions
+            for (int j = 0; j < tid; j++) {
+                float t_j = events[j].timestamp_ns * 1e-9f;
+                compensator += (alpha / beta) * (1.0f - expf(-beta * (t_i - t_j)));
+            }
+        }
+        
+        residuals[tid] = compensator;
+    }
+}
+
+// Host functions for kernel launches
+
+extern "C" {
+
+void launch_exponential_decay_kernel(
+    const HawkesEvent* d_events,
+    float* d_decay_matrix,
+    int n_events,
+    float beta
+) {
+    dim3 block_size(16, 16);
+    dim3 grid_size((n_events + block_size.x - 1) / block_size.x,
+                   (n_events + block_size.y - 1) / block_size.y);
+    
+    calculate_exponential_decay_kernel<<<grid_size, block_size>>>(
+        d_events, d_decay_matrix, n_events, beta
+    );
+}
+
+void launch_hawkes_intensity_kernel(
+    const HawkesEvent* d_events,
+    const float* d_decay_matrix,
+    float* d_intensities,
+    int n_events,
+    float mu,
+    float alpha,
+    int mark_type
+) {
+    int grid_size = (n_events + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    
+    calculate_hawkes_intensity_kernel<<<grid_size, BLOCK_SIZE>>>(
+        d_events, d_decay_matrix, d_intensities, n_events, mu, alpha, mark_type
+    );
+}
+
+void launch_log_likelihood_kernel(
+    const HawkesEvent* d_events,
+    const float* d_intensities,
+    float* d_log_likelihood_terms,
+    int n_events,
+    float mu,
+    float alpha,
+    float beta,
+    float T_end
+) {
+    int grid_size = (n_events + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    
+    calculate_log_likelihood_kernel<<<grid_size, BLOCK_SIZE>>>(
+        d_events, d_intensities, d_log_likelihood_terms, n_events, mu, alpha, beta, T_end
+    );
+}
+
+void launch_parameter_estimation_kernel(
+    const HawkesEvent* d_events,
+    float* d_mu,
+    float* d_alpha,
+    float* d_beta,
+    float* d_gradients,
+    int n_events,
+    float learning_rate,
+    int iteration
+) {
+    estimate_hawkes_parameters_kernel<<<1, 1>>>(
+        d_events, d_mu, d_alpha, d_beta, d_gradients, n_events, learning_rate, iteration
+    );
+}
+
+void launch_clustering_coefficient_kernel(
+    const HawkesEvent* d_events,
+    float* d_clustering_coefficients,
+    int n_events,
+    float time_window_ns
+) {
+    int grid_size = (n_events + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    
+    calculate_clustering_coefficient_kernel<<<grid_size, BLOCK_SIZE>>>(
+        d_events, d_clustering_coefficients, n_events, time_window_ns
+    );
+}
+
+void launch_simulation_kernel(
+    HawkesEvent* d_simulated_events,
+    int* d_n_simulated,
+    float mu,
+    float alpha,
+    float beta,
+    uint64_t start_time_ns,
+    uint64_t end_time_ns,
+    unsigned int* d_random_states,
+    int max_events
+) {
+    simulate_hawkes_process_kernel<<<1, 1>>>(
+        d_simulated_events, d_n_simulated, mu, alpha, beta,
+        start_time_ns, end_time_ns, d_random_states, max_events
+    );
+}
+
+void launch_residuals_kernel(
+    const HawkesEvent* d_events,
+    const float* d_intensities,
+    float* d_residuals,
+    int n_events,
+    float mu,
+    float alpha,
+    float beta
+) {
+    int grid_size = (n_events + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    
+    calculate_hawkes_residuals_kernel<<<grid_size, BLOCK_SIZE>>>(
+        d_events, d_intensities, d_residuals, n_events, mu, alpha, beta
+    );
+}
+
+} // extern "C"
+

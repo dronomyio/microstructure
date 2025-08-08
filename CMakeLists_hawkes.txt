@@ -1,0 +1,374 @@
+cmake_minimum_required(VERSION 3.18)
+project(UltraFastHawkesEngine LANGUAGES CXX CUDA)
+
+# Set C++ standard
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Set CUDA standard
+set(CMAKE_CUDA_STANDARD 17)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
+
+# Build configuration
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# Compiler-specific options
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set(CMAKE_CXX_FLAGS_DEBUG "-g -O0 -Wall -Wextra")
+    set(CMAKE_CXX_FLAGS_RELEASE "-O3 -DNDEBUG -march=native -mtune=native")
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
+endif()
+
+# CUDA compiler options
+set(CMAKE_CUDA_FLAGS_DEBUG "-g -G -O0")
+set(CMAKE_CUDA_FLAGS_RELEASE "-O3 -DNDEBUG --use_fast_math")
+set(CMAKE_CUDA_FLAGS_RELWITHDEBINFO "-O2 -g -DNDEBUG")
+
+# Find required packages
+find_package(CUDA REQUIRED)
+find_package(OpenMP)
+
+# CUDA architecture detection and configuration
+include(FindCUDA/select_compute_arch)
+CUDA_DETECT_INSTALLED_GPUS(INSTALLED_GPU_CCS_1)
+string(STRIP "${INSTALLED_GPU_CCS_1}" INSTALLED_GPU_CCS_2)
+string(REPLACE " " ";" INSTALLED_GPU_CCS_3 "${INSTALLED_GPU_CCS_2}")
+string(REPLACE "." "" CUDA_ARCH_LIST "${INSTALLED_GPU_CCS_3}")
+
+# Set CUDA architectures
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    if(CUDA_ARCH_LIST)
+        set(CMAKE_CUDA_ARCHITECTURES ${CUDA_ARCH_LIST})
+    else()
+        # Default architectures for common GPUs
+        set(CMAKE_CUDA_ARCHITECTURES "60;61;70;75;80;86;89;90")
+    endif()
+endif()
+
+message(STATUS "CUDA Architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+
+# SIMD detection
+include(CheckCXXCompilerFlag)
+include(CheckCXXSourceRuns)
+
+# Check for AVX-512 support
+check_cxx_compiler_flag("-mavx512f" COMPILER_SUPPORTS_AVX512F)
+check_cxx_compiler_flag("-mavx512dq" COMPILER_SUPPORTS_AVX512DQ)
+check_cxx_compiler_flag("-mavx512vl" COMPILER_SUPPORTS_AVX512VL)
+
+# Check for AVX-256 support
+check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
+check_cxx_compiler_flag("-mfma" COMPILER_SUPPORTS_FMA)
+
+# Runtime SIMD detection
+check_cxx_source_runs("
+#include <immintrin.h>
+int main() {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports(\"avx512f\") ? 0 : 1;
+}
+" RUNTIME_SUPPORTS_AVX512)
+
+check_cxx_source_runs("
+#include <immintrin.h>
+int main() {
+    __builtin_cpu_init();
+    return __builtin_cpu_supports(\"avx2\") ? 0 : 1;
+}
+" RUNTIME_SUPPORTS_AVX2)
+
+# Set SIMD flags
+set(SIMD_FLAGS "")
+if(COMPILER_SUPPORTS_AVX512F AND COMPILER_SUPPORTS_AVX512DQ AND COMPILER_SUPPORTS_AVX512VL)
+    set(SIMD_FLAGS "${SIMD_FLAGS} -mavx512f -mavx512dq -mavx512vl")
+    add_definitions(-DHAVE_AVX512)
+    message(STATUS "AVX-512 support: Enabled")
+elseif(COMPILER_SUPPORTS_AVX2 AND COMPILER_SUPPORTS_FMA)
+    set(SIMD_FLAGS "${SIMD_FLAGS} -mavx2 -mfma")
+    add_definitions(-DHAVE_AVX2)
+    message(STATUS "AVX-256 support: Enabled")
+else()
+    message(STATUS "SIMD support: Scalar fallback only")
+endif()
+
+# Intel SVML for fast math functions (if available)
+find_library(SVML_LIBRARY NAMES svml_intel64 svml)
+if(SVML_LIBRARY)
+    message(STATUS "Intel SVML found: ${SVML_LIBRARY}")
+    add_definitions(-DHAVE_INTEL_SVML)
+endif()
+
+# Include directories
+include_directories(${CMAKE_CURRENT_SOURCE_DIR})
+include_directories(${CUDA_INCLUDE_DIRS})
+
+# Source files
+set(GPU_SOURCES
+    hawkes_gpu_kernels.cu
+)
+
+set(SIMD_SOURCES
+    hawkes_simd_processors.cpp
+)
+
+set(ENGINE_SOURCES
+    hawkes_engine.cpp
+)
+
+set(HEADER_FILES
+    hawkes_gpu_kernels.h
+    hawkes_simd_processors.h
+    hawkes_engine.h
+)
+
+# Create GPU kernels library
+add_library(hawkes_gpu_kernels STATIC ${GPU_SOURCES})
+set_target_properties(hawkes_gpu_kernels PROPERTIES
+    CUDA_SEPARABLE_COMPILATION ON
+    CUDA_RESOLVE_DEVICE_SYMBOLS ON
+    POSITION_INDEPENDENT_CODE ON
+)
+
+# CUDA-specific compiler flags
+target_compile_options(hawkes_gpu_kernels PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+        --expt-relaxed-constexpr
+        --expt-extended-lambda
+        --use_fast_math
+        --ptxas-options=-v
+        -Xcompiler -fPIC
+    >
+)
+
+# Create SIMD processors library
+add_library(hawkes_simd_processors STATIC ${SIMD_SOURCES})
+set_target_properties(hawkes_simd_processors PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+
+# Apply SIMD flags to SIMD library
+if(SIMD_FLAGS)
+    target_compile_options(hawkes_simd_processors PRIVATE ${SIMD_FLAGS})
+endif()
+
+# Link Intel SVML if available
+if(SVML_LIBRARY)
+    target_link_libraries(hawkes_simd_processors ${SVML_LIBRARY})
+endif()
+
+# Create main engine library
+add_library(hawkes_engine STATIC ${ENGINE_SOURCES})
+set_target_properties(hawkes_engine PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+)
+
+# Link libraries
+target_link_libraries(hawkes_engine 
+    hawkes_gpu_kernels 
+    hawkes_simd_processors
+    ${CUDA_LIBRARIES}
+    ${CUDA_CUBLAS_LIBRARIES}
+    ${CUDA_CURAND_LIBRARIES}
+)
+
+# OpenMP support
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(hawkes_engine OpenMP::OpenMP_CXX)
+    target_link_libraries(hawkes_simd_processors OpenMP::OpenMP_CXX)
+    message(STATUS "OpenMP support: Enabled")
+endif()
+
+# Create shared library for Python binding
+add_library(hawkes_engine_shared SHARED ${ENGINE_SOURCES})
+set_target_properties(hawkes_engine_shared PROPERTIES
+    OUTPUT_NAME "hawkes_engine"
+    POSITION_INDEPENDENT_CODE ON
+)
+
+target_link_libraries(hawkes_engine_shared 
+    hawkes_gpu_kernels 
+    hawkes_simd_processors
+    ${CUDA_LIBRARIES}
+    ${CUDA_CUBLAS_LIBRARIES}
+    ${CUDA_CURAND_LIBRARIES}
+)
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(hawkes_engine_shared OpenMP::OpenMP_CXX)
+endif()
+
+# C API wrapper for Python
+set(C_API_SOURCES
+    hawkes_c_api.cpp
+)
+
+add_library(hawkes_c_api SHARED ${C_API_SOURCES})
+set_target_properties(hawkes_c_api PROPERTIES
+    OUTPUT_NAME "libhawkes_engine"
+    POSITION_INDEPENDENT_CODE ON
+)
+
+target_link_libraries(hawkes_c_api hawkes_engine_shared)
+
+# Example executable
+add_executable(hawkes_example example_usage.cpp)
+target_link_libraries(hawkes_example hawkes_engine)
+
+# Benchmark executable
+add_executable(hawkes_benchmark benchmark.cpp)
+target_link_libraries(hawkes_benchmark hawkes_engine)
+
+# Test executable
+add_executable(hawkes_test test_hawkes.cpp)
+target_link_libraries(hawkes_test hawkes_engine)
+
+# Python binding with pybind11 (optional)
+find_package(pybind11 QUIET)
+if(pybind11_FOUND)
+    pybind11_add_module(pyhawkes python_binding.cpp)
+    target_link_libraries(pyhawkes PRIVATE hawkes_engine)
+    message(STATUS "pybind11 found: Python module will be built")
+else()
+    message(STATUS "pybind11 not found: Using ctypes interface")
+endif()
+
+# Installation
+install(TARGETS hawkes_engine hawkes_gpu_kernels hawkes_simd_processors hawkes_engine_shared hawkes_c_api
+    LIBRARY DESTINATION lib
+    ARCHIVE DESTINATION lib
+    RUNTIME DESTINATION bin
+)
+
+install(FILES ${HEADER_FILES} DESTINATION include)
+
+# Custom targets for different build configurations
+
+# Release build with maximum optimization
+add_custom_target(release
+    COMMAND ${CMAKE_COMMAND} -DCMAKE_BUILD_TYPE=Release ${CMAKE_SOURCE_DIR}
+    COMMAND ${CMAKE_COMMAND} --build . --parallel
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Building optimized release version"
+)
+
+# Debug build with debugging symbols
+add_custom_target(debug
+    COMMAND ${CMAKE_COMMAND} -DCMAKE_BUILD_TYPE=Debug ${CMAKE_SOURCE_DIR}
+    COMMAND ${CMAKE_COMMAND} --build . --parallel
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Building debug version"
+)
+
+# Profile build for performance analysis
+add_custom_target(profile
+    COMMAND ${CMAKE_COMMAND} -DCMAKE_BUILD_TYPE=RelWithDebInfo ${CMAKE_SOURCE_DIR}
+    COMMAND ${CMAKE_COMMAND} --build . --parallel
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Building profile version"
+)
+
+# Memory check build with sanitizers
+add_custom_target(memcheck
+    COMMAND ${CMAKE_COMMAND} -DCMAKE_BUILD_TYPE=Debug 
+            -DCMAKE_CXX_FLAGS="-fsanitize=address -fsanitize=undefined -g" 
+            ${CMAKE_SOURCE_DIR}
+    COMMAND ${CMAKE_COMMAND} --build . --parallel
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Building with memory sanitizers"
+)
+
+# NVIDIA profiling build
+add_custom_target(nvprof
+    COMMAND ${CMAKE_COMMAND} -DCMAKE_BUILD_TYPE=RelWithDebInfo 
+            -DCMAKE_CUDA_FLAGS="-lineinfo -g" 
+            ${CMAKE_SOURCE_DIR}
+    COMMAND ${CMAKE_COMMAND} --build . --parallel
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Building for NVIDIA profiling"
+)
+
+# Benchmarking target
+add_custom_target(benchmark
+    COMMAND ./hawkes_benchmark
+    DEPENDS hawkes_benchmark
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running performance benchmarks"
+)
+
+# Testing target
+add_custom_target(test_hawkes
+    COMMAND ./hawkes_test
+    DEPENDS hawkes_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    COMMENT "Running Hawkes process tests"
+)
+
+# Documentation generation (if Doxygen is available)
+find_package(Doxygen QUIET)
+if(DOXYGEN_FOUND)
+    configure_file(${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile.in 
+                   ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile @ONLY)
+    add_custom_target(docs
+        ${DOXYGEN_EXECUTABLE} ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+        COMMENT "Generating API documentation with Doxygen"
+        VERBATIM
+    )
+endif()
+
+# Print configuration summary
+message(STATUS "")
+message(STATUS "=== Ultra-Fast Hawkes Engine Configuration ===")
+message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
+message(STATUS "C++ Compiler: ${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}")
+message(STATUS "CUDA Compiler: ${CMAKE_CUDA_COMPILER_VERSION}")
+message(STATUS "CUDA Architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+message(STATUS "SIMD Support: ${SIMD_FLAGS}")
+message(STATUS "OpenMP: ${OpenMP_CXX_FOUND}")
+message(STATUS "Intel SVML: ${SVML_LIBRARY}")
+message(STATUS "pybind11: ${pybind11_FOUND}")
+message(STATUS "Doxygen: ${DOXYGEN_FOUND}")
+message(STATUS "===============================================")
+message(STATUS "")
+
+# Performance optimization hints
+message(STATUS "Performance Optimization Hints:")
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    message(STATUS "  - Use 'make release' for maximum performance")
+endif()
+if(NOT SIMD_FLAGS)
+    message(STATUS "  - Consider upgrading to a CPU with AVX-2 or AVX-512 support")
+endif()
+if(NOT OpenMP_CXX_FOUND)
+    message(STATUS "  - Install OpenMP for better CPU parallelization")
+endif()
+if(NOT SVML_LIBRARY)
+    message(STATUS "  - Install Intel MKL for faster math functions")
+endif()
+message(STATUS "")
+
+# Build commands help
+message(STATUS "Build Commands:")
+message(STATUS "  make release     - Optimized release build")
+message(STATUS "  make debug       - Debug build with symbols")
+message(STATUS "  make profile     - Profile build for analysis")
+message(STATUS "  make memcheck    - Build with memory sanitizers")
+message(STATUS "  make nvprof      - Build for NVIDIA profiling")
+message(STATUS "  make benchmark   - Run performance benchmarks")
+message(STATUS "  make test_hawkes - Run unit tests")
+if(DOXYGEN_FOUND)
+message(STATUS "  make docs        - Generate documentation")
+endif()
+message(STATUS "")
+
+# Example usage
+message(STATUS "Example Usage:")
+message(STATUS "  mkdir build && cd build")
+message(STATUS "  cmake ..")
+message(STATUS "  make release")
+message(STATUS "  ./hawkes_example")
+message(STATUS "  python3 ../hawkes_python_wrapper.py")
+message(STATUS "")
+

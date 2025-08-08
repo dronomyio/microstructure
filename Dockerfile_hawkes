@@ -1,0 +1,513 @@
+# Ultra-Fast Hawkes Process Engine - Production Docker Container
+# Multi-stage build for optimal performance and minimal size
+
+# Stage 1: CUDA Development Environment
+FROM nvidia/cuda:12.2-devel-ubuntu22.04 AS cuda-builder
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CUDA_ARCH_LIST="60;61;70;75;80;86;89;90"
+ENV CMAKE_BUILD_TYPE=Release
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    wget \
+    curl \
+    python3 \
+    python3-pip \
+    python3-dev \
+    libomp-dev \
+    intel-mkl-full \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Intel MKL for SIMD optimization
+RUN wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | apt-key add - && \
+    echo "deb https://apt.repos.intel.com/mkl all main" > /etc/apt/sources.list.d/intel-mkl.list && \
+    apt-get update && apt-get install -y intel-mkl-64bit-2023.2.0 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Set Intel MKL environment
+ENV MKLROOT=/opt/intel/mkl
+ENV LD_LIBRARY_PATH=${MKLROOT}/lib/intel64:$LD_LIBRARY_PATH
+
+# Install Python dependencies
+RUN pip3 install --no-cache-dir \
+    numpy \
+    pandas \
+    matplotlib \
+    seaborn \
+    scipy \
+    ctypes-callable \
+    pybind11
+
+# Set working directory
+WORKDIR /app
+
+# Copy source files
+COPY hawkes_gpu_kernels.cu hawkes_gpu_kernels.h ./
+COPY hawkes_simd_processors.cpp hawkes_simd_processors.h ./
+COPY hawkes_engine.cpp hawkes_engine.h ./
+COPY hawkes_python_wrapper.py ./
+COPY CMakeLists_hawkes.txt ./CMakeLists.txt
+
+# Create C API wrapper for Python ctypes
+RUN cat > hawkes_c_api.cpp << 'EOF'
+#include "hawkes_engine.h"
+#include <cstring>
+
+extern "C" {
+    // Engine management
+    void* create_hawkes_engine(HawkesEngineConfig* config) {
+        try {
+            return new HawkesEngine(*config);
+        } catch (...) {
+            return nullptr;
+        }
+    }
+    
+    void destroy_hawkes_engine(void* engine) {
+        if (engine) {
+            delete static_cast<HawkesEngine*>(engine);
+        }
+    }
+    
+    // Main analysis function
+    bool analyze_hawkes_process(
+        void* engine,
+        HawkesEvent* events,
+        size_t n_events,
+        HawkesParameters* initial_params,
+        HawkesParameters* result_params,
+        HawkesStatistics* result_stats,
+        float* intensities,
+        float* clustering_coeffs,
+        float* residuals,
+        double* processing_time_ms,
+        double* throughput
+    ) {
+        if (!engine || !events || !initial_params || !result_params || !result_stats) {
+            return false;
+        }
+        
+        try {
+            HawkesEngine* eng = static_cast<HawkesEngine*>(engine);
+            std::vector<HawkesEvent> events_vec(events, events + n_events);
+            
+            HawkesResults results = eng->analyze_hawkes_process(events_vec, *initial_params);
+            
+            // Copy parameters
+            result_params->mu = results.parameters.mu;
+            result_params->alpha = results.parameters.alpha;
+            result_params->beta = results.parameters.beta;
+            result_params->branching_ratio = results.parameters.branching_ratio;
+            result_params->log_likelihood = results.parameters.log_likelihood;
+            result_params->aic = results.parameters.aic;
+            result_params->bic = results.parameters.bic;
+            result_params->n_events = results.parameters.n_events;
+            
+            // Copy statistics
+            result_stats->mean_intensity = results.statistics.mean_intensity;
+            result_stats->max_intensity = results.statistics.max_intensity;
+            result_stats->intensity_variance = results.statistics.intensity_variance;
+            result_stats->clustering_coefficient = results.statistics.clustering_coefficient;
+            result_stats->burstiness = results.statistics.burstiness;
+            result_stats->memory_coefficient = results.statistics.memory_coefficient;
+            result_stats->criticality_index = results.statistics.criticality_index;
+            result_stats->goodness_of_fit = results.statistics.goodness_of_fit;
+            
+            // Copy arrays
+            if (intensities) {
+                std::copy(results.intensities.begin(), results.intensities.end(), intensities);
+            }
+            if (clustering_coeffs) {
+                std::copy(results.clustering_coefficients.begin(), results.clustering_coefficients.end(), clustering_coeffs);
+            }
+            if (residuals) {
+                std::copy(results.residuals.begin(), results.residuals.end(), residuals);
+            }
+            
+            *processing_time_ms = results.processing_time_ms;
+            *throughput = results.throughput_events_per_sec;
+            
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+    
+    // Simulation function
+    bool simulate_hawkes_process(
+        void* engine,
+        HawkesParameters* params,
+        uint64_t start_time_ns,
+        uint64_t end_time_ns,
+        int max_events,
+        HawkesEvent* output_events,
+        int* n_simulated
+    ) {
+        if (!engine || !params || !output_events || !n_simulated) {
+            return false;
+        }
+        
+        try {
+            HawkesEngine* eng = static_cast<HawkesEngine*>(engine);
+            std::vector<HawkesEvent> simulated = eng->simulate_hawkes_process(
+                *params, start_time_ns, end_time_ns, max_events
+            );
+            
+            *n_simulated = std::min((int)simulated.size(), max_events);
+            std::copy(simulated.begin(), simulated.begin() + *n_simulated, output_events);
+            
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+    
+    // Utility function
+    const char* get_simd_level_name(void* engine) {
+        if (!engine) return "Unknown";
+        
+        try {
+            HawkesEngine* eng = static_cast<HawkesEngine*>(engine);
+            HawkesEngineStatus status = eng->get_status();
+            static std::string level = status.simd_level;
+            return level.c_str();
+        } catch (...) {
+            return "Error";
+        }
+    }
+}
+EOF
+
+# Create example usage file
+RUN cat > example_usage.cpp << 'EOF'
+#include "hawkes_engine.h"
+#include <iostream>
+#include <vector>
+#include <chrono>
+
+int main() {
+    std::cout << "Ultra-Fast Hawkes Process Engine - Example Usage\n";
+    std::cout << "================================================\n\n";
+    
+    // Configuration
+    HawkesEngineConfig config;
+    config.use_gpu = true;
+    config.max_events = 100000;
+    config.estimate_parameters = true;
+    
+    // Create engine
+    HawkesEngine engine(config);
+    
+    // Get status
+    HawkesEngineStatus status = engine.get_status();
+    std::cout << "Engine Status:\n";
+    std::cout << "  GPU Available: " << (status.gpu_available ? "Yes" : "No") << "\n";
+    std::cout << "  SIMD Level: " << status.simd_level << "\n";
+    std::cout << "  Max Events: " << status.max_events << "\n\n";
+    
+    // Simulate some events
+    HawkesParameters sim_params = {0.1f, 0.3f, 1.0f};
+    uint64_t start_time = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::high_resolution_clock::now().time_since_epoch()
+    ).count();
+    uint64_t end_time = start_time + 3600ULL * 1000000000ULL;  // 1 hour
+    
+    std::cout << "Simulating Hawkes process...\n";
+    std::vector<HawkesEvent> events = engine.simulate_hawkes_process(
+        sim_params, start_time, end_time, 5000
+    );
+    std::cout << "✓ Simulated " << events.size() << " events\n\n";
+    
+    // Analyze the events
+    std::cout << "Analyzing Hawkes process...\n";
+    HawkesParameters initial_guess = {0.05f, 0.2f, 0.8f};
+    HawkesResults results = engine.analyze_hawkes_process(events, initial_guess);
+    
+    std::cout << "✓ Analysis completed in " << results.processing_time_ms << " ms\n";
+    std::cout << "✓ Throughput: " << results.throughput_events_per_sec << " events/sec\n\n";
+    
+    // Display results
+    std::cout << "Results:\n";
+    std::cout << "  Method: " << results.processing_method << "\n";
+    std::cout << "  μ (base): " << results.parameters.mu << "\n";
+    std::cout << "  α (jump): " << results.parameters.alpha << "\n";
+    std::cout << "  β (decay): " << results.parameters.beta << "\n";
+    std::cout << "  Branching ratio: " << results.parameters.branching_ratio << "\n";
+    std::cout << "  Log-likelihood: " << results.parameters.log_likelihood << "\n";
+    std::cout << "  Clustering coeff: " << results.statistics.clustering_coefficient << "\n";
+    std::cout << "  Burstiness: " << results.statistics.burstiness << "\n";
+    std::cout << "  Subcritical: " << (results.is_subcritical ? "Yes" : "No") << "\n\n";
+    
+    std::cout << "✓ Example completed successfully!\n";
+    return 0;
+}
+EOF
+
+# Create benchmark file
+RUN cat > benchmark.cpp << 'EOF'
+#include "hawkes_engine.h"
+#include <iostream>
+#include <vector>
+#include <chrono>
+
+int main() {
+    std::cout << "Ultra-Fast Hawkes Process Engine - Performance Benchmark\n";
+    std::cout << "========================================================\n\n";
+    
+    HawkesEngineConfig config;
+    config.use_gpu = true;
+    config.max_events = 1000000;
+    
+    HawkesEngine engine(config);
+    
+    // Test different event sizes
+    std::vector<size_t> test_sizes = {1000, 5000, 10000, 50000, 100000, 500000};
+    
+    for (size_t n_events : test_sizes) {
+        std::cout << "Benchmarking " << n_events << " events...\n";
+        
+        // Generate test events
+        std::vector<HawkesEvent> events(n_events);
+        uint64_t base_time = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::high_resolution_clock::now().time_since_epoch()
+        ).count();
+        
+        for (size_t i = 0; i < n_events; i++) {
+            events[i].timestamp_ns = base_time + i * 1000000;  // 1ms intervals
+            events[i].mark = 0;
+            events[i].price = 100.0f + (i % 100) * 0.01f;
+            events[i].size = 100.0f;
+            events[i].exchange_id = i % 4;
+            strcpy(events[i].ticker, "BENCH");
+        }
+        
+        // Benchmark analysis
+        HawkesParameters params = {0.1f, 0.3f, 1.0f};
+        auto start = std::chrono::high_resolution_clock::now();
+        
+        HawkesResults results = engine.analyze_hawkes_process(events, params);
+        
+        auto end = std::chrono::high_resolution_clock::now();
+        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
+        
+        std::cout << "  Processing time: " << duration.count() / 1000.0 << " ms\n";
+        std::cout << "  Throughput: " << results.throughput_events_per_sec << " events/sec\n";
+        std::cout << "  Method: " << results.processing_method << "\n\n";
+    }
+    
+    std::cout << "✓ Benchmark completed!\n";
+    return 0;
+}
+EOF
+
+# Create test file
+RUN cat > test_hawkes.cpp << 'EOF'
+#include "hawkes_engine.h"
+#include <iostream>
+#include <vector>
+#include <cassert>
+#include <cmath>
+
+bool test_basic_functionality() {
+    std::cout << "Testing basic functionality...\n";
+    
+    HawkesEngineConfig config;
+    config.use_gpu = false;  // Use CPU for deterministic testing
+    config.max_events = 10000;
+    
+    HawkesEngine engine(config);
+    
+    // Test simulation
+    HawkesParameters params = {0.1f, 0.3f, 1.0f};
+    uint64_t start_time = 1000000000000ULL;
+    uint64_t end_time = start_time + 3600ULL * 1000000000ULL;
+    
+    std::vector<HawkesEvent> events = engine.simulate_hawkes_process(
+        params, start_time, end_time, 1000
+    );
+    
+    assert(!events.empty());
+    assert(events.size() <= 1000);
+    
+    // Test analysis
+    HawkesResults results = engine.analyze_hawkes_process(events, params);
+    
+    assert(results.n_events == events.size());
+    assert(results.parameters.mu > 0);
+    assert(results.parameters.alpha > 0);
+    assert(results.parameters.beta > 0);
+    assert(results.processing_time_ms > 0);
+    
+    std::cout << "✓ Basic functionality test passed\n";
+    return true;
+}
+
+bool test_parameter_estimation() {
+    std::cout << "Testing parameter estimation...\n";
+    
+    HawkesEngineConfig config;
+    config.estimate_parameters = true;
+    config.max_iterations = 100;
+    
+    HawkesEngine engine(config);
+    
+    // Known parameters
+    HawkesParameters true_params = {0.2f, 0.4f, 1.5f};
+    
+    // Simulate with known parameters
+    uint64_t start_time = 1000000000000ULL;
+    uint64_t end_time = start_time + 3600ULL * 1000000000ULL;
+    
+    std::vector<HawkesEvent> events = engine.simulate_hawkes_process(
+        true_params, start_time, end_time, 2000
+    );
+    
+    // Estimate parameters with different initial guess
+    HawkesParameters initial_guess = {0.1f, 0.2f, 1.0f};
+    HawkesResults results = engine.analyze_hawkes_process(events, initial_guess);
+    
+    // Check if estimated parameters are reasonably close to true parameters
+    float mu_error = std::abs(results.parameters.mu - true_params.mu) / true_params.mu;
+    float alpha_error = std::abs(results.parameters.alpha - true_params.alpha) / true_params.alpha;
+    float beta_error = std::abs(results.parameters.beta - true_params.beta) / true_params.beta;
+    
+    std::cout << "  True μ: " << true_params.mu << ", Estimated: " << results.parameters.mu << " (error: " << mu_error*100 << "%)\n";
+    std::cout << "  True α: " << true_params.alpha << ", Estimated: " << results.parameters.alpha << " (error: " << alpha_error*100 << "%)\n";
+    std::cout << "  True β: " << true_params.beta << ", Estimated: " << results.parameters.beta << " (error: " << beta_error*100 << "%)\n";
+    
+    // Allow for reasonable estimation error (within 50%)
+    assert(mu_error < 0.5f);
+    assert(alpha_error < 0.5f);
+    assert(beta_error < 0.5f);
+    
+    std::cout << "✓ Parameter estimation test passed\n";
+    return true;
+}
+
+int main() {
+    std::cout << "Ultra-Fast Hawkes Process Engine - Unit Tests\n";
+    std::cout << "==============================================\n\n";
+    
+    try {
+        test_basic_functionality();
+        test_parameter_estimation();
+        
+        std::cout << "\n✓ All tests passed successfully!\n";
+        return 0;
+    } catch (const std::exception& e) {
+        std::cerr << "✗ Test failed: " << e.what() << "\n";
+        return 1;
+    } catch (...) {
+        std::cerr << "✗ Test failed with unknown exception\n";
+        return 1;
+    }
+}
+EOF
+
+# Build the project
+RUN mkdir build && cd build && \
+    cmake -DCMAKE_BUILD_TYPE=Release .. && \
+    make -j$(nproc) && \
+    make install
+
+# Stage 2: Runtime Environment
+FROM nvidia/cuda:12.2-runtime-ubuntu22.04 AS runtime
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python3-pip \
+    libomp5 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+RUN pip3 install --no-cache-dir \
+    numpy \
+    pandas \
+    matplotlib \
+    seaborn \
+    scipy
+
+# Copy built libraries and executables
+COPY --from=cuda-builder /app/build/lib* /usr/local/lib/
+COPY --from=cuda-builder /app/build/hawkes_example /usr/local/bin/
+COPY --from=cuda-builder /app/build/hawkes_benchmark /usr/local/bin/
+COPY --from=cuda-builder /app/build/hawkes_test /usr/local/bin/
+COPY --from=cuda-builder /app/hawkes_python_wrapper.py /app/
+
+# Set library path
+ENV LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
+
+# Set working directory
+WORKDIR /app
+
+# Create entrypoint script
+RUN cat > entrypoint.sh << 'EOF'
+#!/bin/bash
+set -e
+
+echo "Ultra-Fast Hawkes Process Engine - Docker Container"
+echo "=================================================="
+echo ""
+
+# Check GPU availability
+if nvidia-smi > /dev/null 2>&1; then
+    echo "✓ NVIDIA GPU detected:"
+    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits
+    echo ""
+else
+    echo "⚠ No NVIDIA GPU detected - using CPU/SIMD only"
+    echo ""
+fi
+
+# Check SIMD capabilities
+echo "CPU SIMD Capabilities:"
+if grep -q avx512 /proc/cpuinfo; then
+    echo "✓ AVX-512 supported"
+elif grep -q avx2 /proc/cpuinfo; then
+    echo "✓ AVX-256 supported"
+else
+    echo "⚠ Basic SIMD only"
+fi
+echo ""
+
+# Run the specified command or default to example
+if [ $# -eq 0 ]; then
+    echo "Running example usage..."
+    hawkes_example
+    echo ""
+    echo "Running Python wrapper example..."
+    python3 hawkes_python_wrapper.py
+else
+    exec "$@"
+fi
+EOF
+
+RUN chmod +x entrypoint.sh
+
+# Expose port for potential web service
+EXPOSE 8080
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD hawkes_test || exit 1
+
+# Set entrypoint
+ENTRYPOINT ["./entrypoint.sh"]
+
+# Default command
+CMD []
+
+# Labels for metadata
+LABEL maintainer="Ultra-Fast Hawkes Engine Team"
+LABEL version="1.0.0"
+LABEL description="Ultra-fast Hawkes process analysis engine with GPU/SIMD acceleration"
+LABEL gpu.required="true"
+LABEL gpu.architectures="60,61,70,75,80,86,89,90"
+

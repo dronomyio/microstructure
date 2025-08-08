@@ -1,0 +1,465 @@
+version: '3.8'
+
+services:
+  # Main Hawkes Process Engine
+  hawkes-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile_hawkes
+      target: runtime
+    image: ultra-fast-hawkes-engine:latest
+    container_name: hawkes-engine-main
+    restart: unless-stopped
+    
+    # GPU configuration
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    # Environment variables
+    environment:
+      - CUDA_VISIBLE_DEVICES=all
+      - OMP_NUM_THREADS=16
+      - MKL_NUM_THREADS=16
+      - CUDA_CACHE_DISABLE=0
+      - CUDA_CACHE_MAXSIZE=2147483648  # 2GB cache
+      - PYTHONPATH=/app
+      - LD_LIBRARY_PATH=/usr/local/lib:/usr/local/cuda/lib64
+    
+    # Volume mounts
+    volumes:
+      - ./data:/app/data:rw
+      - ./output:/app/output:rw
+      - ./logs:/app/logs:rw
+      - hawkes-cache:/tmp/hawkes-cache
+    
+    # Network configuration
+    networks:
+      - hawkes-network
+    
+    # Port mapping for potential web service
+    ports:
+      - "8080:8080"
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "hawkes_test"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    
+    # Resource limits
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    
+    # Shared memory for large datasets
+    shm_size: 8gb
+    
+    # Command override for production
+    command: ["python3", "hawkes_python_wrapper.py"]
+
+  # Benchmark Service
+  hawkes-benchmark:
+    image: ultra-fast-hawkes-engine:latest
+    container_name: hawkes-benchmark
+    profiles: ["benchmark"]
+    
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    environment:
+      - CUDA_VISIBLE_DEVICES=all
+      - OMP_NUM_THREADS=16
+    
+    volumes:
+      - ./benchmark-results:/app/benchmark-results:rw
+    
+    networks:
+      - hawkes-network
+    
+    command: ["hawkes_benchmark"]
+
+  # Development Environment
+  hawkes-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile_hawkes
+      target: cuda-builder
+    image: ultra-fast-hawkes-engine:dev
+    container_name: hawkes-dev
+    profiles: ["development"]
+    
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    environment:
+      - CUDA_VISIBLE_DEVICES=all
+      - CMAKE_BUILD_TYPE=Debug
+    
+    volumes:
+      - .:/app:rw
+      - hawkes-dev-cache:/app/build
+    
+    networks:
+      - hawkes-network
+    
+    working_dir: /app
+    command: ["bash"]
+    stdin_open: true
+    tty: true
+
+  # Redis for caching (optional)
+  redis:
+    image: redis:7-alpine
+    container_name: hawkes-redis
+    profiles: ["caching"]
+    restart: unless-stopped
+    
+    command: redis-server --appendonly yes --maxmemory 2gb --maxmemory-policy allkeys-lru
+    
+    volumes:
+      - hawkes-redis-data:/data
+    
+    networks:
+      - hawkes-network
+    
+    ports:
+      - "6379:6379"
+
+  # PostgreSQL for metadata storage (optional)
+  postgres:
+    image: postgres:15-alpine
+    container_name: hawkes-postgres
+    profiles: ["database"]
+    restart: unless-stopped
+    
+    environment:
+      - POSTGRES_DB=hawkes_metadata
+      - POSTGRES_USER=hawkes_user
+      - POSTGRES_PASSWORD=hawkes_password
+    
+    volumes:
+      - hawkes-postgres-data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    
+    networks:
+      - hawkes-network
+    
+    ports:
+      - "5432:5432"
+
+  # Monitoring with Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: hawkes-prometheus
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--storage.tsdb.retention.time=200h'
+      - '--web.enable-lifecycle'
+    
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - hawkes-prometheus-data:/prometheus
+    
+    networks:
+      - hawkes-network
+    
+    ports:
+      - "9090:9090"
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:latest
+    container_name: hawkes-grafana
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=hawkes_admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    
+    volumes:
+      - hawkes-grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    
+    networks:
+      - hawkes-network
+    
+    ports:
+      - "3000:3000"
+    
+    depends_on:
+      - prometheus
+
+  # NGINX Load Balancer (for multiple engine instances)
+  nginx:
+    image: nginx:alpine
+    container_name: hawkes-nginx
+    profiles: ["loadbalancer"]
+    restart: unless-stopped
+    
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+    
+    networks:
+      - hawkes-network
+    
+    ports:
+      - "80:80"
+      - "443:443"
+    
+    depends_on:
+      - hawkes-engine
+
+  # File Server for data distribution
+  file-server:
+    image: nginx:alpine
+    container_name: hawkes-file-server
+    profiles: ["fileserver"]
+    restart: unless-stopped
+    
+    volumes:
+      - ./output:/usr/share/nginx/html/output:ro
+      - ./data:/usr/share/nginx/html/data:ro
+      - ./nginx/file-server.conf:/etc/nginx/conf.d/default.conf:ro
+    
+    networks:
+      - hawkes-network
+    
+    ports:
+      - "8081:80"
+
+# Networks
+networks:
+  hawkes-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# Volumes
+volumes:
+  hawkes-cache:
+    driver: local
+  hawkes-dev-cache:
+    driver: local
+  hawkes-redis-data:
+    driver: local
+  hawkes-postgres-data:
+    driver: local
+  hawkes-prometheus-data:
+    driver: local
+  hawkes-grafana-data:
+    driver: local
+
+# Configuration files that need to be created
+x-config-files: &config-files
+  # Create these configuration files in your project directory:
+  
+  # ./monitoring/prometheus.yml
+  prometheus-config: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    
+    scrape_configs:
+      - job_name: 'hawkes-engine'
+        static_configs:
+          - targets: ['hawkes-engine:8080']
+        metrics_path: '/metrics'
+        scrape_interval: 5s
+  
+  # ./nginx/nginx.conf
+  nginx-config: |
+    events {
+        worker_connections 1024;
+    }
+    
+    http {
+        upstream hawkes_backend {
+            least_conn;
+            server hawkes-engine:8080;
+            # Add more instances for load balancing:
+            # server hawkes-engine-2:8080;
+            # server hawkes-engine-3:8080;
+        }
+        
+        server {
+            listen 80;
+            server_name localhost;
+            
+            location / {
+                proxy_pass http://hawkes_backend;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                
+                # Timeouts for long-running analysis
+                proxy_connect_timeout 60s;
+                proxy_send_timeout 300s;
+                proxy_read_timeout 300s;
+            }
+            
+            location /health {
+                access_log off;
+                return 200 "healthy\n";
+                add_header Content-Type text/plain;
+            }
+        }
+    }
+  
+  # ./nginx/file-server.conf
+  file-server-config: |
+    server {
+        listen 80;
+        server_name localhost;
+        root /usr/share/nginx/html;
+        
+        location / {
+            autoindex on;
+            autoindex_exact_size off;
+            autoindex_localtime on;
+        }
+        
+        location /output/ {
+            alias /usr/share/nginx/html/output/;
+            autoindex on;
+        }
+        
+        location /data/ {
+            alias /usr/share/nginx/html/data/;
+            autoindex on;
+        }
+    }
+  
+  # ./sql/init.sql
+  postgres-init: |
+    CREATE TABLE IF NOT EXISTS hawkes_analysis_runs (
+        id SERIAL PRIMARY KEY,
+        ticker VARCHAR(10) NOT NULL,
+        start_time TIMESTAMP NOT NULL,
+        end_time TIMESTAMP NOT NULL,
+        n_events INTEGER NOT NULL,
+        mu REAL NOT NULL,
+        alpha REAL NOT NULL,
+        beta REAL NOT NULL,
+        log_likelihood REAL NOT NULL,
+        processing_time_ms REAL NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE INDEX idx_hawkes_ticker_time ON hawkes_analysis_runs(ticker, start_time);
+
+# Usage examples and commands
+x-usage-examples: &usage-examples
+  basic-usage: |
+    # Start the main engine
+    docker-compose up hawkes-engine
+    
+    # Run benchmark
+    docker-compose --profile benchmark up hawkes-benchmark
+    
+    # Development environment
+    docker-compose --profile development up hawkes-dev
+    
+    # Full monitoring stack
+    docker-compose --profile monitoring up -d
+    
+    # Scale engine instances
+    docker-compose up -d --scale hawkes-engine=3
+    
+    # View logs
+    docker-compose logs -f hawkes-engine
+    
+    # Execute commands in running container
+    docker-compose exec hawkes-engine python3 hawkes_python_wrapper.py
+    
+    # Clean up
+    docker-compose down -v
+
+  production-deployment: |
+    # Production deployment with monitoring
+    docker-compose --profile monitoring --profile loadbalancer up -d
+    
+    # Scale for high throughput
+    docker-compose up -d --scale hawkes-engine=4
+    
+    # Health check
+    curl http://localhost/health
+    
+    # Access Grafana dashboard
+    # http://localhost:3000 (admin/hawkes_admin)
+    
+    # Access Prometheus metrics
+    # http://localhost:9090
+
+  data-processing: |
+    # Mount your data directory
+    # Place quote data in ./data/
+    # Results will be in ./output/
+    
+    # Process specific ticker
+    docker-compose exec hawkes-engine python3 -c "
+    from hawkes_python_wrapper import UltraFastHawkesAnalyzer
+    import pandas as pd
+    
+    # Load your data
+    df = pd.read_csv('/app/data/AAPL_quotes.csv')
+    
+    # Analyze
+    analyzer = UltraFastHawkesAnalyzer()
+    results = analyzer.analyze_hawkes_process(df)
+    
+    # Save results
+    results.to_csv('/app/output/AAPL_hawkes_results.csv')
+    "
+
+# Environment-specific configurations
+x-environments: &environments
+  development:
+    profiles: ["development"]
+    environment:
+      - CMAKE_BUILD_TYPE=Debug
+      - CUDA_LAUNCH_BLOCKING=1
+    
+  testing:
+    profiles: ["testing"]
+    command: ["hawkes_test"]
+    
+  production:
+    profiles: ["monitoring", "loadbalancer"]
+    environment:
+      - CMAKE_BUILD_TYPE=Release
+      - OMP_NUM_THREADS=32
+    
+  benchmark:
+    profiles: ["benchmark"]
+    environment:
+      - BENCHMARK_MODE=1
+      - CUDA_VISIBLE_DEVICES=all
+
