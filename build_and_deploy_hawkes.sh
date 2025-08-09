@@ -148,7 +148,8 @@ configure_cmake() {
     esac
     
     # Run CMake
-    cmake "${CMAKE_OPTS[@]}" -f ../CMakeLists_hawkes.txt ..
+    #cmake "${CMAKE_OPTS[@]}" -f ../CMakeLists_hawkes.txt ..
+    cmake "${CMAKE_OPTS[@]}" ..
     
     cd ..
     print_success "CMake configuration completed"

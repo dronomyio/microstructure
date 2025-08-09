@@ -1,3 +1,5 @@
+#include <cmath>
+#include <algorithm>
 #include "hawkes_engine.h"
 #include "hawkes_gpu_kernels.h"
 #include "hawkes_simd_processors.h"

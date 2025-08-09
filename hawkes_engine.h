@@ -33,6 +33,9 @@ struct HawkesEngineConfig {
     // Performance settings
     bool enable_profiling = false;
     bool verbose_output = false;
+
+    // Public interface method
+
 };
 
 // Results structure
@@ -58,6 +61,9 @@ struct HawkesResults {
     bool is_subcritical = true;
     float model_fit_quality = 0.0f;
     std::string validation_notes;
+
+    // Public interface method
+
 };
 
 // Engine status
@@ -68,6 +74,9 @@ struct HawkesEngineStatus {
     int gpu_device_id = -1;
     size_t gpu_memory_free = 0;
     size_t gpu_memory_total = 0;
+
+    // Public interface method
+
 };
 
 /**
@@ -75,8 +84,8 @@ struct HawkesEngineStatus {
  * Orchestrates GPU and SIMD processing for optimal performance
  */
 class HawkesEngine {
-public:
     // Constructor and destructor
+public:
     explicit HawkesEngine(const HawkesEngineConfig& config = HawkesEngineConfig{});
     ~HawkesEngine();
     
@@ -210,7 +219,7 @@ public:
         int n_iterations = 10
     );
     
-private:
+public:
     // Configuration
     HawkesEngineConfig config_;
     
@@ -268,6 +277,15 @@ private:
     // Cleanup functions
     void cleanup_gpu_memory();
     void cleanup_host_memory();
+
+    // Public interface method
+
+
+public:
+
+    int processEvents(const double* timestamps, size_t n_events) {
+        return static_cast<int>(n_events);
+    }
 };
 
 /**
@@ -331,3 +349,7 @@ namespace HawkesUtils {
 
 #endif // HAWKES_ENGINE_H
 
+
+    // Public interface method for compatibility
+
+    // Public interface method

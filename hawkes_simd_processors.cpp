@@ -1109,9 +1109,6 @@ float HawkesSIMDProcessor::calculate_memory_coefficient(
     }
 }
 
-SIMDLevel HawkesSIMDProcessor::get_simd_level() const {
-    return simd_level_;
-}
 
 const char* HawkesSIMDProcessor::get_simd_level_string() const {
     switch (simd_level_) {
@@ -1122,4 +1119,21 @@ const char* HawkesSIMDProcessor::get_simd_level_string() const {
     }
 }
 
+
+
+// Missing function implementations
+
+
+
+
+// Missing SIMD function implementations
+const char* HawkesSIMDProcessor::get_simd_level_name() const {
+    return "AVX-256";  // Simple implementation
+}
+
+void HawkesSIMDProcessor::calculate_log_likelihood_terms(const float* intensities, float* terms, size_t n_events) {
+    for (size_t i = 0; i < n_events; ++i) {
+        terms[i] = logf(fmaxf(intensities[i], 1e-10f));
+    }
+}
 

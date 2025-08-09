@@ -358,6 +358,7 @@ public:
     
     // Utility functions
     SIMDLevel get_simd_level() const { return simd_level_; }
+    const char* get_simd_level_string() const;
     const char* get_simd_level_name() const;
     
     // Performance benchmarking
