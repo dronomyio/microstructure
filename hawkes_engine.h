@@ -18,7 +18,8 @@ struct HawkesEngineConfig {
     size_t gpu_threshold = 1000;  // Minimum events to use GPU
     
     // Memory settings
-    size_t max_events = 1000000;
+    //size_t max_events = 1000000;
+    size_t max_events = 1000;
     
     // Parameter estimation settings
     bool estimate_parameters = true;

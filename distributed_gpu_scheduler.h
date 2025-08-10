@@ -1,13 +1,7 @@
-/*
- * Distributed GPU Scheduler Header
- * Fault-tolerant load balancing for 4-GPU Hawkes Processes Engine
- */
-
 #ifndef DISTRIBUTED_GPU_SCHEDULER_H
 #define DISTRIBUTED_GPU_SCHEDULER_H
 
 #include <cuda_runtime.h>
-#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -16,48 +10,37 @@ extern "C" {
 // Constants
 #define MAX_GPUS 4
 
-// GPU roles
-#define ROLE_LEADER 0
-#define ROLE_BACKUP 1
-#define ROLE_WORKER 2
-#define ROLE_FAILED 3
+// Scheduler statistics structure
+struct SchedulerStats {
+    int num_gpus;
+    float utilization[MAX_GPUS];
+    size_t memory_allocated[MAX_GPUS];
+    bool peer_access[MAX_GPUS][MAX_GPUS];
+};
 
-// Status structure for host queries
-typedef struct {
-    int current_leader;
-    int backup_leader;
-    int my_role;
-    bool consensus_active;
-    float system_throughput;
-    int failed_gpu_count;
-    
-    bool gpu_alive[MAX_GPUS];
-    int gpu_roles[MAX_GPUS];
-    float gpu_health_scores[MAX_GPUS];
-    float gpu_utilizations[MAX_GPUS];
-    int queue_lengths[MAX_GPUS];
-} DistributedSchedulerStatus;
+// Initialization and cleanup
+bool initialize_distributed_scheduler();
+void cleanup_distributed_scheduler();
 
-// Host interface functions
-cudaError_t initialize_distributed_scheduler(int num_gpus);
+// Work distribution
+void distribute_work_load(size_t total_work, size_t* work_per_gpu);
+bool synchronize_all_gpus();
 
-cudaError_t run_distributed_scheduling_cycle(
-    int my_gpu_id,
-    int* task_assignments,
-    int n_tasks,
-    float* gpu_metrics
-);
+// Memory management
+bool allocate_distributed_memory(size_t size_per_gpu);
 
-cudaError_t get_distributed_scheduler_status(
-    int my_gpu_id,
-    DistributedSchedulerStatus* status
-);
+// Statistics and monitoring
+void get_scheduler_stats(void* stats_ptr);
+void update_gpu_utilization(int gpu_id, float utilization);
+int get_optimal_gpu();
 
-cudaError_t force_leader_election(int my_gpu_id);
+// Inter-GPU communication
+bool copy_between_gpus(int src_gpu, int dst_gpu, void* src_ptr, void* dst_ptr, size_t size);
 
 #ifdef __cplusplus
 }
 #endif
 
 #endif // DISTRIBUTED_GPU_SCHEDULER_H
+
 
